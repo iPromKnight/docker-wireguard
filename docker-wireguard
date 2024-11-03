@@ -1,0 +1,328 @@
+
+###
+###
+#
+#   Install required packages (https://www.wireguard.com/install/)
+#
+#     >$ sudo dnf install iproute wireguard-tools
+#
+#     >$ sudo apt install iproute wireguard
+#
+#   Install/Update a Systemd timer:
+#
+#     >$ /docker-wg-net.sh --network-name wg0-net install
+#
+#   Add script to crontab:
+#
+#     >$ sudo crontab -e
+#
+#       > * * * * * /path/to/docker-wg-net.sh --network-name tvh-net --wg-device-name wg0-tvh-docker --wg-config /etc/wireguard/wg0-tvh-docker.conf up >> /var/log/docker-wg-net.log 2>&1
+#       > @reboot /path/to/docker-wg-net.sh --network-name tvh-net --wg-device-name wg0-tvh-docker --wg-config /etc/wireguard/wg0-tvh-docker.conf up >> /var/log/docker-wg-net.log 2>&1
+#
+#
+###
+
+# Check if the script is being run as root, if not, re-execute with sudo
+if [ "$EUID" -ne 0 ]; then
+  echo "Script is not running as root. Re-executing with sudo..."
+  exec sudo "$0" "$@"
+  exit
+fi
+
+# Default values
+#   docker_network_name
+#       Specify the docker network name
+docker_network_name="wireguard"
+#   docker_network_subnet_cidr
+#       Specify the docker network CIDR
+docker_network_subnet_cidr="10.20.0.0/16"
+#   wireguard_device_name
+#       The name of the interface to create
+wireguard_device_name="wg0-docker"
+#   wireguard_config
+#       The path to the wireguard config to use
+wireguard_config="/etc/wireguard/wg0-docker.conf"
+#   network_mtu
+#       WireGuard typically adds an overhead of around 60-80 bytes to each packet. By setting the MTU to 1420, you reduce the
+#       likelihood of packet fragmentation, which can occur if the packets exceed the MTU of the underlying network 
+#       (usually 1500 bytes). This helps maintain efficient and reliable network performance.
+network_mtu=1420
+#   routing_table_number
+#       Can be any free number 1-252 not in 'ip rule show | grep -w "lookup"'.
+#       Ensure you manage this number in conjunction with the docker_network_name and wireguard_device_name when running 'down'.
+routing_table_number=100
+
+# Parse command-line arguments
+provided_args=""
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    --network-name) docker_network_name="$2"; provided_args="$provided_args $1 $2"; shift ;;
+    --subnet-cidr) docker_network_subnet_cidr="$2"; provided_args="$provided_args $1 $2"; shift ;;
+    --wg-device-name) wireguard_device_name="$2"; provided_args="$provided_args $1 $2"; shift ;;
+    --wg-config) wireguard_config="$2"; provided_args="$provided_args $1 $2"; shift ;;
+    --mtu) network_mtu="$2"; provided_args="$provided_args $1 $2"; shift ;;
+    --routing-table) routing_table_number="$2"; provided_args="$provided_args $1 $2"; shift ;;
+    up) command="up"; shift ;;
+    down) command="down"; shift ;;
+    status) command="status"; shift ;;
+    install) command="install"; shift ;;
+    uninstall) command="uninstall"; shift ;;
+  esac
+  shift
+done
+
+# Extract the IP address and subnet prefix length from the WireGuard configuration file
+conf_check() {
+  if [ ! -f "$wireguard_config" ]; then
+    echo -e "[FAIL] no conf file found at $wireguard_config"
+    exit 1
+  fi
+  wg_ip_address=$(grep Address "$wireguard_config" | awk '{print $3}' | cut -d/ -f1)
+  wg_subnet=$(grep Address "$wireguard_config" | awk '{print $3}' | cut -d/ -f2)
+}
+
+# Function to check if a routing table number is in use
+routing_table_check() {
+  if ip rule show | grep -qw "lookup $routing_table_number"; then
+    echo "[WARNING] Routing table number $routing_table_number is already in use."
+    return 1
+  else
+    return 0
+  fi
+}
+
+# Function to check command success
+command_check() {
+  local check_cmd="$1"
+  if ! eval "$check_cmd" > /dev/null 2>&1; then
+    echo "[FAIL] Command failed: $check_cmd"
+    return 1
+  fi
+  return 0
+}
+
+# Function to wait for a condition to be met
+while_command_check() {
+  local check_cmd="$1"
+  while ! eval "$check_cmd" > /dev/null 2>&1; do
+    sleep 1
+  done
+  return 0
+}
+
+# Function to bring up the WireGuard interface and Docker network
+up() {
+  echo "[ UP ]"
+  conf_check
+
+  # Create Docker network if it does not exist
+  echo "Create Docker network if it does not exist."
+  if ! docker network ls --filter name=^${docker_network_name}$ --format="{{ .Name }}" | grep -q "^${docker_network_name}$"; then
+    echo "  - Docker network ${docker_network_name} does not exist, creating it..."
+    docker network create ${docker_network_name} \
+      --subnet ${docker_network_subnet_cidr} \
+      -o com.docker.network.driver.mtu=${network_mtu} &> /dev/null
+  else
+    echo "  - Docker network ${docker_network_name} already exists."
+  fi
+  echo "[ DONE ]"
+
+  # Check if the wg0 interface is up
+  echo "Create wg0 interface if it does not exist."
+  if ! (ip link show ${wireguard_device_name} 2> /dev/null | grep -q "UP" && ip link show ${wireguard_device_name} 2> /dev/null | grep -q "LOWER_UP"); then
+    # Check if route table already exists
+    routing_table_check
+
+    echo "  - Interface ${wireguard_device_name} is down. Add wireguard device."
+    ip link add dev ${wireguard_device_name} type wireguard
+    command_check "ip addr | grep ${wireguard_device_name} > /dev/null 2>&1" || exit 1
+
+    echo "  - Applying the settings to the WireGuard interface."
+    temp_wireguard_config=$(mktemp)
+    if [ ! -f "$temp_wireguard_config" ]; then
+      echo "[FAIL] Unable to create temporary file."
+      exit 1
+    fi
+    sed -e 's/^Address =/#&/' -e 's/^DNS =/#&/' ${wireguard_config} > ${temp_wireguard_config}
+    wg setconf ${wireguard_device_name} ${temp_wireguard_config}
+    rm -f ${temp_wireguard_config}
+    command_check "wg showconf ${wireguard_device_name} > /dev/null 2>&1" || exit 1
+
+    echo "  - Assign IP to wireguard interface '${wg_ip_address}' to dev ${wireguard_device_name}."
+    ip address add ${wg_ip_address} dev ${wireguard_device_name}
+
+    echo "  - Enable IP forwarding."
+    sysctl -w net.ipv4.ip_forward=1 &> /dev/null || exit 1
+    command_check "grep 1 /proc/sys/net/ipv4/ip_forward > /dev/null 2>&1" || exit 1
+
+    echo "  - Setting MTU to '${network_mtu}' for dev ${wireguard_device_name}."
+    ip link set mtu ${network_mtu} dev ${wireguard_device_name}
+
+    echo "  - Ensure the wireguard interface is up."
+    ip link set up dev ${wireguard_device_name}
+    while_command_check "ip link show ${wireguard_device_name} 2> /dev/null | grep -q UP"
+
+    echo "  - Add table ${routing_table_number}."
+    ip rule add from ${docker_network_subnet_cidr} table ${routing_table_number}
+    while_command_check "ip rule show | grep -w 'lookup ${routing_table_number}' > /dev/null 2>&1"
+
+    echo "  - Add default route."
+    ip route add default via ${wg_ip_address} metric 1 table ${routing_table_number}
+    while_command_check "ip route show table ${routing_table_number} 2>/dev/null | grep -w ${wg_ip_address} > /dev/null 2>&1"
+
+    echo "  - Add blackhole route."
+    ip route add blackhole default metric 2 table ${routing_table_number}
+    while_command_check "ip route show table ${routing_table_number} 2>/dev/null | grep -w blackhole > /dev/null 2>&1"
+
+    echo "  - Ensure that traffic is not routed using the main routing table."
+    ip rule add table main suppress_prefixlength 0
+
+    echo "  - Enable NAT for traffic from the Docker network that is routed through the WireGuard VPN interface."
+    iptables -t nat -A POSTROUTING -s ${docker_network_subnet_cidr} -o ${wireguard_device_name} -j MASQUERADE
+
+    echo "  - Update iptables to allow traffic between the Docker network and the host."
+    iptables -A FORWARD -i ${wireguard_device_name} -o ${docker_network_name} -j ACCEPT
+    iptables -A FORWARD -i ${docker_network_name} -o ${wireguard_device_name} -j ACCEPT
+
+    if [ $? -eq 0 ]; then
+      echo "  - ${wireguard_device_name} interface brought up successfully."
+    else
+      echo "  - Failed to bring up ${wireguard_device_name} interface."
+    fi
+  else
+    echo "  - Interface ${wireguard_device_name} is up and running."
+  fi
+  echo "[ DONE ]"
+
+  # Check connection
+  status
+}
+
+# Function to bring down the WireGuard interface and Docker network
+down() {
+  echo "[ DOWN ]"
+  conf_check
+
+  echo "Bringing down the ${wireguard_device_name} interface and Docker network ${docker_network_name}..."
+
+  # Bring down the WireGuard interface
+  ip link set down dev ${wireguard_device_name}
+  ip link delete dev ${wireguard_device_name}
+
+  # Check if the Docker network is in use
+  containers_using_network=$(docker network inspect -f '{{json .Containers}}' ${docker_network_name} 2> /dev/null)
+  if [[ "${containers_using_network}" = "{}" || -z "${containers_using_network}" ]]; then
+    echo "  - Docker network ${docker_network_name} is not in use, deleting it..."
+    docker network rm ${docker_network_name} &> /dev/null
+  else
+    echo "  - Docker network ${docker_network_name} is still in use. Please stop all containers using this network first."
+  fi
+
+  # Remove routing rules
+  echo "  - Remove routing rules"
+  ip rule del from ${docker_network_subnet_cidr} table ${routing_table_number}
+  ip route del table ${routing_table_number} blackhole default
+  ip route del table ${routing_table_number} default via ${wg_ip_address}
+  ip rule del table main suppress_prefixlength 0
+
+  # Remove iptables rules
+  echo "  - Remove iptables rules"
+  iptables -t nat -D POSTROUTING -s ${docker_network_subnet_cidr} -o ${wireguard_device_name} -j MASQUERADE
+  iptables -D FORWARD -i ${wireguard_device_name} -o ${docker_network_name} -j ACCEPT
+  iptables -D FORWARD -i ${docker_network_name} -o ${wireguard_device_name} -j ACCEPT
+
+  echo "${wireguard_device_name} interface and Docker network ${docker_network_name} brought down successfully."
+}
+
+
+# Function to check VPN status
+status() {
+  conf_check
+
+  host_ip=$(curl -4 -s ifconfig.co)
+  vpn_ip=$(docker run --rm --net=${docker_network_name} --stop-timeout 5 curlimages/curl -4 -s -m 5 ifconfig.co 2> /dev/null || echo "")
+
+  if [[ -n "$vpn_ip" && "$vpn_ip" != "$host_ip" ]]; then
+    echo "VPN is UP. VPN IP: $vpn_ip"
+  else
+    echo "VPN is DOWN. Host IP: $host_ip"
+  fi
+}
+
+install() {
+  mkdir -p /usr/local/share/bin
+  cp "$0" /usr/local/share/bin/docker-wg-net
+  chmod 775 /usr/local/share/bin/docker-wg-net
+  
+  # Sanitize docker_network_name for use in instance names (e.g., replace invalid characters with hyphens)
+  sanitized_docker_network_name=${docker_network_name//[^a-zA-Z0-9_.-]/-}
+  
+  # Create Systemd Unit Template
+  cat << EOF > /etc/systemd/system/docker-wg-net@.service
+[Unit]
+Description=Ensure WireGuard tunnel is up for Docker network %i
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/share/bin/docker-wg-net $provided_args up
+EOF
+
+  # Create Systemd Timer Template
+  cat << EOF > /etc/systemd/system/docker-wg-net@.timer
+[Unit]
+Description=Periodically run docker-wg-net service for %i
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+Unit=docker-wg-net@%i.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # Reload and start timer
+  systemctl daemon-reload
+  systemctl enable docker-wg-net@${sanitized_docker_network_name}.timer
+  systemctl restart docker-wg-net@${sanitized_docker_network_name}.timer
+}
+
+uninstall() {
+  # Sanitize docker_network_name for use in instance names (e.g., replace invalid characters with hyphens)
+  sanitized_docker_network_name=${docker_network_name//[^a-zA-Z0-9_.-]/-}
+  
+  # Stop and disable the timer
+  systemctl stop docker-wg-net@${sanitized_docker_network_name}.timer
+  systemctl disable docker-wg-net@${sanitized_docker_network_name}.timer
+
+  # Reload the systemd daemon to apply changes
+  systemctl daemon-reload
+
+  echo "Uninstalled docker-wg-net@${sanitized_docker_network_name}."
+}
+
+
+# Main script execution
+case "$command" in
+  up)
+    up
+    ;;
+  down)
+    down
+    ;;
+  status)
+    status
+    ;;
+  install)
+    install
+    ;;
+  uninstall)
+    uninstall
+    ;;
+  *)
+    echo "Usage: $0 {up|down|status|install} [--network-name <name>] [--subnet-cidr <cidr>] [--wg-device-name <name>] [--wg-config <path>] [--mtu <mtu>] [--routing-table <number>]"
+    exit 1
+    ;;
+esac
